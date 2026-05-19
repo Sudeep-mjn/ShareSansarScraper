@@ -1,5 +1,8 @@
 name: Scrape NEPSE Data to Google Sheets
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ master, main ]
