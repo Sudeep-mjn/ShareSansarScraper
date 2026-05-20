@@ -30,8 +30,14 @@ class MarketSpider(scrapy.Spider):
                 'google_creds.json', self.scope)
             self.client = gspread.authorize(self.creds)
             
-            # Open your Google Sheet (create one named "NEPSE_Stock_Data" first)
-            self.sheet = self.client.open('NEPSE_Stock_Data').sheet1
+            # Open your Google Sheet. Prefer 'nepseScrap' (user sheet name),
+            # fall back to 'NEPSE_Stock_Data' for older installs.
+            try:
+                self.sheet = self.client.open('nepseScrap').sheet1
+                self.logger.info("Connected to Google Sheet 'nepseScrap'")
+            except Exception:
+                self.sheet = self.client.open('NEPSE_Stock_Data').sheet1
+                self.logger.info("Connected to Google Sheet 'NEPSE_Stock_Data'")
             
             # Add headers if sheet is empty
             if len(self.sheet.get_all_values()) == 0:
@@ -152,65 +158,71 @@ class MarketSpider(scrapy.Spider):
         - Skip if today's full table equals previous day's table
         - Do not overwrite an existing worksheet for the same date
         """
+        # Append today's rows into the single master worksheet (sheet1)
         if not stock_data_list:
             self.logger.info("No stock data extracted — skipping sheet save (market closed?)")
             return
 
-        try:
-            spreadsheet = self.client.open('NEPSE_Stock_Data')
-        except Exception as e:
-            self.logger.error(f"Could not open spreadsheet: {e}")
-            return
-
-        # If worksheet for this date already exists, do not modify it
-        try:
-            ws_existing = spreadsheet.worksheet(current_date)
-            self.logger.info(f"Worksheet '{current_date}' already exists — not modifying")
-            return
-        except gspread.exceptions.WorksheetNotFound:
-            pass
-
         df_today = pd.DataFrame(stock_data_list)
 
-        # Compare with previous day's data using master CSV if available
-        master_file = 'Data/all_stocks_master.csv'
-        if os.path.exists(master_file):
-            try:
-                master_df = pd.read_csv(master_file)
-                # find previous date (latest date different from current_date)
-                prev_dates = [d for d in master_df['Date'].unique() if d != current_date]
-                if prev_dates:
-                    prev_date = max(prev_dates)
-                    prev_df = master_df[master_df['Date'] == prev_date]
+        # Get existing records from the sheet
+        try:
+            existing = self.sheet.get_all_records()
+            existing_df = pd.DataFrame(existing) if existing else pd.DataFrame()
+        except Exception as e:
+            self.logger.warning(f"Could not read existing sheet records: {e}")
+            existing_df = pd.DataFrame()
 
-                    # compare core columns (exclude Date/Time ordering differences)
-                    compare_cols = [
-                        'Symbol','Previous Close','Open','High','Low','Close',
-                        'Difference','Percent Change','Volume','Traded Shares','Amount'
-                    ]
-                    if set(compare_cols).issubset(prev_df.columns) and set(compare_cols).issubset(df_today.columns):
-                        prev_sorted = prev_df[compare_cols].sort_values(by='Symbol').reset_index(drop=True)
-                        today_sorted = df_today[compare_cols].sort_values(by='Symbol').reset_index(drop=True)
-                        if prev_sorted.equals(today_sorted):
-                            self.logger.info("Today's data matches previous day's data — skipping sheet save")
-                            return
-            except Exception as e:
-                self.logger.warning(f"Error comparing with master CSV: {e}")
+        # If there are already rows for this date, compare and skip if identical
+        if not existing_df.empty and 'Date' in existing_df.columns:
+            today_existing = existing_df[existing_df['Date'] == current_date]
+            if not today_existing.empty:
+                # compare rows on key columns
+                compare_cols = ['Symbol','Previous Close','Open','High','Low','Close',
+                                'Difference','Percent Change','Volume','Traded Shares','Amount']
+                try:
+                    prev_sorted = today_existing[compare_cols].sort_values(by='Symbol').reset_index(drop=True)
+                    today_sorted = df_today[compare_cols].sort_values(by='Symbol').reset_index(drop=True)
+                    if prev_sorted.equals(today_sorted):
+                        self.logger.info("Today's data already in master sheet and matches — skipping append")
+                        return
+                except Exception:
+                    # If comparison fails, fall back to per-row existence check below
+                    pass
 
-        # Otherwise create new worksheet and upload data
+        # Build rows to append, avoid exact duplicate rows (Date, Time, Symbol)
         headers = ['Date','Time','Symbol','Previous Close','Open','High','Low','Close',
                    'Difference','Percent Change','Volume','Traded Shares','Amount']
 
-        try:
-            rows = [headers]
-            for _, row in df_today.iterrows():
-                rows.append([str(row.get(h, '')) for h in headers])
+        rows_to_append = []
+        existing_keys = set()
+        if not existing_df.empty and {'Date','Time','Symbol'}.issubset(existing_df.columns):
+            for _, r in existing_df.iterrows():
+                existing_keys.add((str(r['Date']), str(r.get('Time','')), str(r.get('Symbol',''))))
 
-            ws = spreadsheet.add_worksheet(title=current_date, rows=str(len(rows)+5), cols=str(len(headers)))
-            ws.update(rows)
-            self.logger.info(f"Created worksheet '{current_date}' with {len(rows)-1} rows")
+        for _, r in df_today.iterrows():
+            key = (str(r.get('Date', current_date)), str(r.get('Time','')), str(r.get('Symbol','')))
+            if key in existing_keys:
+                # skip exact duplicate
+                continue
+            rows_to_append.append([str(r.get(h, '')) for h in headers])
+
+        if not rows_to_append:
+            self.logger.info("No new rows to append to master sheet")
+            return
+
+        try:
+            # append_rows is more efficient for bulk appends
+            self.sheet.append_rows(rows_to_append, value_input_option='RAW')
+            self.logger.info(f"Appended {len(rows_to_append)} new rows to master sheet")
         except Exception as e:
-            self.logger.error(f"Failed to create/update worksheet '{current_date}': {e}")
+            # fallback to appending row-by-row
+            self.logger.warning(f"Bulk append failed: {e} — attempting row-by-row")
+            for row in rows_to_append:
+                try:
+                    self.sheet.append_row(row)
+                except Exception as ee:
+                    self.logger.error(f"Failed to append row: {ee}")
     
     def save_to_csv(self, stock_data_list, current_date):
         """Save data to CSV file"""
