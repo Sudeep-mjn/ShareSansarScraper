@@ -59,11 +59,11 @@ class MarketSpider(scrapy.Spider):
         
         for row in table_rows[1:]:  # Skip header row
             columns = row.css('td')
-            if len(columns) >= 11:
+            if len(columns) >= 12:
                 try:
-                    symbol = self.clean_text(columns[0].css('::text').get())
+                    symbol = self.clean_text(columns[1].css('::text').get())
                     
-                    # Skip if symbol is empty
+                    # Skip if symbol is empty or if row is just a serial number row
                     if not symbol:
                         continue
                     
@@ -71,16 +71,16 @@ class MarketSpider(scrapy.Spider):
                         'Date': current_date,
                         'Time': current_time,
                         'Symbol': symbol,
-                        'Previous Close': self.clean_text(columns[1].css('::text').get()),
-                        'Open': self.clean_text(columns[2].css('::text').get()),
-                        'High': self.clean_text(columns[3].css('::text').get()),
-                        'Low': self.clean_text(columns[4].css('::text').get()),
-                        'Close': self.clean_text(columns[5].css('::text').get()),
-                        'Difference': self.clean_text(columns[6].css('::text').get()),
-                        'Percent Change': self.clean_text(columns[7].css('::text').get()),
-                        'Volume': self.clean_text(columns[8].css('::text').get()),
-                        'Traded Shares': self.clean_text(columns[9].css('::text').get()),
-                        'Amount': self.clean_text(columns[10].css('::text').get())
+                        'Previous Close': self.clean_text(columns[2].css('::text').get()),
+                        'Open': self.clean_text(columns[3].css('::text').get()),
+                        'High': self.clean_text(columns[4].css('::text').get()),
+                        'Low': self.clean_text(columns[5].css('::text').get()),
+                        'Close': self.clean_text(columns[6].css('::text').get()),
+                        'Difference': self.clean_text(columns[7].css('::text').get()),
+                        'Percent Change': self.clean_text(columns[8].css('::text').get()),
+                        'Volume': self.clean_text(columns[9].css('::text').get()),
+                        'Traded Shares': self.clean_text(columns[10].css('::text').get()),
+                        'Amount': self.clean_text(columns[11].css('::text').get())
                     }
                     
                     stock_data_list.append(stock_data)
