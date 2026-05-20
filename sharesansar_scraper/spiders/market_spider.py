@@ -6,6 +6,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import re
 import os
+from string import Template
+import gspread.exceptions
 
 class MarketSpider(scrapy.Spider):
     name = "market"
@@ -85,9 +87,7 @@ class MarketSpider(scrapy.Spider):
                     
                     stock_data_list.append(stock_data)
                     
-                    # Add to Google Sheets if available
-                    if self.sheet:
-                        self.add_to_google_sheets(stock_data)
+                    # collect rows; we'll write to Google Sheets in bulk later
                     
                     scraped_count += 1
                     
@@ -97,12 +97,24 @@ class MarketSpider(scrapy.Spider):
         # Save to CSV backup
         if stock_data_list:
             self.save_to_csv(stock_data_list, current_date)
-        
+
+        # Save daily worksheet to Google Sheets (bulk) with dedup/closed checks
+        if self.sheet:
+            try:
+                self.save_daily_sheet(stock_data_list, current_date)
+            except Exception as e:
+                self.logger.error(f"Error saving daily sheet: {e}")
         self.logger.info(f"Successfully scraped {scraped_count} stocks")
-        
-        # Create HTML report
-        self.create_html_report(stock_data_list, current_date)
-        
+
+        # Capture the raw HTML table from the source so we can render it exactly
+        try:
+            raw_table_html = response.css('table.table-bordered').get()
+        except Exception:
+            raw_table_html = None
+
+        # Create HTML report (include raw table HTML for exact view)
+        self.create_html_report(stock_data_list, current_date, raw_table_html)
+
         return stock_data_list
     
     def clean_text(self, text):
@@ -128,10 +140,77 @@ class MarketSpider(scrapy.Spider):
                 stock_data['Difference'],
                 stock_data['Percent Change']
             ]
-            self.sheet.append_row(row)
-            self.logger.debug(f"Added {stock_data['Symbol']} to Google Sheets")
+            # Deprecated: per-row append removed in favor of bulk daily writes
+            self.logger.debug("add_to_google_sheets called but per-row append is disabled")
         except Exception as e:
             self.logger.error(f"Error adding to Google Sheets: {e}")
+
+    def save_daily_sheet(self, stock_data_list, current_date):
+        """Save full day's data as a new worksheet in the Google Spreadsheet.
+
+        - Skip if market appears closed (no rows)
+        - Skip if today's full table equals previous day's table
+        - Do not overwrite an existing worksheet for the same date
+        """
+        if not stock_data_list:
+            self.logger.info("No stock data extracted — skipping sheet save (market closed?)")
+            return
+
+        try:
+            spreadsheet = self.client.open('NEPSE_Stock_Data')
+        except Exception as e:
+            self.logger.error(f"Could not open spreadsheet: {e}")
+            return
+
+        # If worksheet for this date already exists, do not modify it
+        try:
+            ws_existing = spreadsheet.worksheet(current_date)
+            self.logger.info(f"Worksheet '{current_date}' already exists — not modifying")
+            return
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+
+        df_today = pd.DataFrame(stock_data_list)
+
+        # Compare with previous day's data using master CSV if available
+        master_file = 'Data/all_stocks_master.csv'
+        if os.path.exists(master_file):
+            try:
+                master_df = pd.read_csv(master_file)
+                # find previous date (latest date different from current_date)
+                prev_dates = [d for d in master_df['Date'].unique() if d != current_date]
+                if prev_dates:
+                    prev_date = max(prev_dates)
+                    prev_df = master_df[master_df['Date'] == prev_date]
+
+                    # compare core columns (exclude Date/Time ordering differences)
+                    compare_cols = [
+                        'Symbol','Previous Close','Open','High','Low','Close',
+                        'Difference','Percent Change','Volume','Traded Shares','Amount'
+                    ]
+                    if set(compare_cols).issubset(prev_df.columns) and set(compare_cols).issubset(df_today.columns):
+                        prev_sorted = prev_df[compare_cols].sort_values(by='Symbol').reset_index(drop=True)
+                        today_sorted = df_today[compare_cols].sort_values(by='Symbol').reset_index(drop=True)
+                        if prev_sorted.equals(today_sorted):
+                            self.logger.info("Today's data matches previous day's data — skipping sheet save")
+                            return
+            except Exception as e:
+                self.logger.warning(f"Error comparing with master CSV: {e}")
+
+        # Otherwise create new worksheet and upload data
+        headers = ['Date','Time','Symbol','Previous Close','Open','High','Low','Close',
+                   'Difference','Percent Change','Volume','Traded Shares','Amount']
+
+        try:
+            rows = [headers]
+            for _, row in df_today.iterrows():
+                rows.append([str(row.get(h, '')) for h in headers])
+
+            ws = spreadsheet.add_worksheet(title=current_date, rows=str(len(rows)+5), cols=str(len(headers)))
+            ws.update(rows)
+            self.logger.info(f"Created worksheet '{current_date}' with {len(rows)-1} rows")
+        except Exception as e:
+            self.logger.error(f"Failed to create/update worksheet '{current_date}': {e}")
     
     def save_to_csv(self, stock_data_list, current_date):
         """Save data to CSV file"""
@@ -154,7 +233,7 @@ class MarketSpider(scrapy.Spider):
         except Exception as e:
             self.logger.error(f"Error saving CSV: {e}")
     
-    def create_html_report(self, stock_data_list, current_date):
+    def create_html_report(self, stock_data_list, current_date, raw_table_html=None):
         """Create HTML report for browser viewing"""
         try:
             df = pd.DataFrame(stock_data_list)
@@ -167,13 +246,24 @@ class MarketSpider(scrapy.Spider):
             total_volume = df['Volume'].astype(float).sum() if not df.empty else 0
             avg_close = df['Close'].astype(float).mean() if not df.empty else 0
             
-            html_content = f"""
+            # Prepare HTML parts to avoid f-string brace issues
+            top_gainers_html = self.generate_top_gainers_html(top_gainers)
+            top_losers_html = self.generate_top_losers_html(top_losers)
+            complete_table_html = self.generate_complete_table_html(df)
+            history_table_html = self.generate_history_table_html(master_df)
+            now_time = datetime.now().strftime('%H:%M:%S')
+            # Pre-format numeric values for template
+            avg_close_str = f"{avg_close:,.2f}"
+            total_volume_str = f"{total_volume:,.0f}"
+            len_df_str = str(len(df))
+
+            html_template = Template("""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NEPSE Stock Market Report - {current_date}</title>
+    <title>NEPSE Stock Market Report - $current_date</title>
     <style>
         * {{
             margin: 0;
@@ -354,30 +444,31 @@ class MarketSpider(scrapy.Spider):
     <div class="container">
         <div class="header">
             <h1>📈 NEPSE Stock Market Report</h1>
-            <p>Data scraped from ShareSansar.com | {current_date} at {datetime.now().strftime('%H:%M:%S')}</p>
+            <p>Data scraped from ShareSansar.com | $current_date at $now_time</p>
         </div>
         <div class="stats">
             <div class="stat-card">
                 <h3>Total Companies</h3>
-                <div class="value">{len(df)}</div>
+                <div class="value">$len_df</div>
             </div>
             <div class="stat-card">
                 <h3>Average Closing Price</h3>
-                <div class="value">रू {avg_close:,.2f}</div>
+                <div class="value">रू $avg_close</div>
             </div>
             <div class="stat-card">
                 <h3>Total Volume</h3>
-                <div class="value">{total_volume:,.0f}</div>
+                <div class="value">$total_volume</div>
             </div>
             <div class="stat-card">
                 <h3>Last Updated</h3>
-                <div class="value">{datetime.now().strftime('%H:%M:%S')}</div>
+                <div class="value">$now_time</div>
             </div>
         </div>
         <div class="button-row">
             <button class="btn" onclick="showSection('latest')">Show Latest Data</button>
             <button class="btn btn-secondary" onclick="showSection('history')">Load Previous Data</button>
-            <button class="btn" onclick="downloadCsv('../Data/{current_date}.csv', 'share_sansar_{current_date}.csv')">Download Today's CSV</button>
+            <button class="btn" onclick="toggleRaw()">Show Original Extracted Table</button>
+            <button class="btn" onclick="downloadCsv('../Data/$current_date.csv', 'share_sansar_$current_date.csv')">Download Today's CSV</button>
             <button class="btn btn-secondary" onclick="downloadCsv('../Data/all_stocks_master.csv', 'share_sansar_all_data.csv')">Download All Data</button>
             <button class="btn" onclick="downloadFilteredTable()">Download Filtered View</button>
         </div>
@@ -401,9 +492,17 @@ class MarketSpider(scrapy.Spider):
                         </tr>
                     </thead>
                     <tbody>
-                        {self.generate_complete_table_html(df)}
+                        $complete_table_html
                     </tbody>
                 </table>
+            </div>
+        </div>
+
+        <div id="rawTableContainer" class="section hidden">
+            <h2>🧾 Original Extracted Table (Exact)</h2>
+            <div class="stock-table">
+                <!-- Raw HTML from source inserted below -->
+                {raw_table_html if raw_table_html else '<p>No raw table available</p>'}
             </div>
         </div>
         <div id="history" class="section hidden">
@@ -417,7 +516,7 @@ class MarketSpider(scrapy.Spider):
                         </tr>
                     </thead>
                     <tbody>
-                        {self.generate_history_table_html(master_df)}
+                        $history_table_html
                     </tbody>
                 </table>
             </div>
@@ -520,6 +619,19 @@ class MarketSpider(scrapy.Spider):
 </body>
 </html>
             """
+            )
+            html_content = html_template.substitute(
+                current_date=current_date,
+                now_time=now_time,
+                avg_close=avg_close_str,
+                total_volume=total_volume_str,
+                len_df=len_df_str,
+                top_gainers_html=top_gainers_html,
+                top_losers_html=top_losers_html,
+                complete_table_html=complete_table_html,
+                history_table_html=history_table_html,
+                raw_table_html=(raw_table_html if raw_table_html else '<p>No raw table available</p>')
+            )
             
             # Save HTML file
             with open('docs/index.html', 'w', encoding='utf-8') as f:
